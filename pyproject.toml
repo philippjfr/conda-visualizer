@@ -84,10 +84,12 @@ compile = { cmd = "panel compile conda_visualizer", env = { PYTHONPATH = "./src"
 python-build = "*"
 twine = "*"
 hatch-vcs = "*"
+rattler-build = "*"
 
 [tool.pixi.feature.build.tasks]
 build-wheel = "python -m build ."
-check-wheel = "twine check dist/*"
+check-wheel = "twine check dist/*.whl dist/*.tar.gz"
+build-conda = { cmd = "CONDA_VISUALIZER_VERSION=$(hatchling version) rattler-build build --recipe recipe --output-dir dist/conda", depends-on = ["build-wheel"] }
 build-browser = "python scripts/build_browser.py"
 
 [tool.pixi.tasks]

@@ -1,0 +1,54 @@
+# Repackages the wheel from `pixi run -e build build-wheel` so the conda package
+# ships the same compiled bundle and hatch-vcs version as the PyPI artifact.
+context:
+  name: conda-visualizer
+  version: ${{ env.get("CONDA_VISUALIZER_VERSION") }}
+  python_min: "3.11"
+
+package:
+  name: ${{ name }}
+  version: ${{ version }}
+
+source:
+  path: ../dist/conda_visualizer-${{ version }}-py3-none-any.whl
+
+build:
+  number: 0
+  noarch: python
+  script: ${{ PYTHON }} -m pip install conda_visualizer-${{ version }}-py3-none-any.whl --no-deps --no-build-isolation -vv
+  python:
+    entry_points:
+      - conda-visualizer = conda_visualizer.cli:main
+
+requirements:
+  host:
+    - python ${{ python_min }}.*
+    - pip
+  run:
+    - python >=${{ python_min }}
+    - networkx >=3
+    - panel >=1.8
+    - panel-material-ui >=0.10
+    - param >=2
+    - pydot >=3
+    - packaging
+    - pyyaml
+  run_constraints:
+    - py-rattler >=0.20
+
+tests:
+  - python:
+      imports:
+        - conda_visualizer
+        - conda_visualizer.cli
+      python_version: ${{ python_min }}.*
+  - script:
+      - conda-visualizer --help
+  - package_contents:
+      site_packages:
+        - conda_visualizer/dist/conda-visualizer.bundle.js
+
+about:
+  homepage: https://github.com/philippjfr/panel-conda-visualizer
+  summary: Interactive dependency graphs for conda environments, lockfiles and DOT files
+  license: BSD-3-Clause
