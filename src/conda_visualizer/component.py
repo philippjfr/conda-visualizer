@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 DIST = Path(__file__).parent / "dist"
 
-LAYOUTS = ["dagre", "elk", "fcose", "breadthfirst", "cose", "concentric", "circle", "grid"]
+LAYOUTS = ["auto", "dagre", "elk", "fcose", "breadthfirst", "cose", "concentric", "circle", "grid"]
 
 
 class CytoscapeGraph(JSComponent):
@@ -35,10 +35,17 @@ class CytoscapeGraph(JSComponent):
         it travels with the data so it cannot arrive after the update it applies to.""",
     )
 
-    layout = param.Selector(default="dagre", objects=LAYOUTS, doc="Cytoscape layout algorithm.")
+    layout = param.Selector(
+        default="auto",
+        objects=LAYOUTS,
+        doc="""Cytoscape layout algorithm. ``auto`` uses dagre in whichever of top-down or
+        left-right fits the canvas better, and fcose when neither keeps labels readable.""",
+    )
 
     rank_dir = param.Selector(
-        default="TB", objects=["TB", "LR", "BT", "RL"], doc="Direction of hierarchical layouts."
+        default="TB",
+        objects=["TB", "LR", "BT", "RL"],
+        doc="Direction of hierarchical layouts; ``auto`` picks its own.",
     )
 
     selected = param.String(default=None, allow_None=True, doc="Id of the selected node.")
@@ -59,6 +66,10 @@ class CytoscapeGraph(JSComponent):
     dark_theme = param.Boolean(default=False, doc="Use the dark color palette.")
 
     search = param.String(default="", doc="Highlight packages whose name contains this text.")
+
+    isolated = param.Boolean(
+        default=False, doc="Show only the selected package and the packages highlighted with it."
+    )
 
     toolbar = param.Boolean(
         default=True, doc="Show the built-in search, layout and image export toolbar."
@@ -104,12 +115,20 @@ class CytoscapeGraph(JSComponent):
     def fit(self) -> None:
         self._send_msg({"type": "fit"})
 
+    def zoom(self, factor: float) -> None:
+        """Zoom around the middle of the canvas by ``factor``."""
+        self._send_msg({"type": "zoom", "factor": factor})
+
     def relayout(self) -> None:
         self._send_msg({"type": "layout"})
 
     def export(self, fmt: str = "png", filename: str | None = None) -> None:
         """Trigger a browser download of the full graph as PNG or SVG."""
         self._send_msg({"type": "export", "format": fmt, "filename": filename or self.filename})
+
+    def download(self, text: str, filename: str, mime: str = "text/plain") -> None:
+        """Trigger a browser download of ``text``."""
+        self._send_msg({"type": "download", "text": text, "filename": filename, "mime": mime})
 
     def _handle_msg(self, data) -> None:
         if data.get("type") == "dblclick":
