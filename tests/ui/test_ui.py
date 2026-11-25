@@ -128,6 +128,9 @@ def test_toolbar_controls_sync(page):
     wait_for_nodes(page, 5)
     page.locator(".cy-toolbar select").nth(0).select_option("grid")
     wait_until(lambda: graph.layout == "grid", page)
+    # Direction only applies to the hierarchical layouts.
+    expect(page.locator(".cy-toolbar select").nth(1)).to_be_disabled()
+    page.locator(".cy-toolbar select").nth(0).select_option("dagre")
     page.locator(".cy-toolbar select").nth(1).select_option("LR")
     wait_until(lambda: graph.rank_dir == "LR", page)
     graph.toolbar = False
@@ -237,7 +240,8 @@ def test_explorer_app(page, prefix, monkeypatch):
     explorer.focus = "base"
     wait_until(lambda: cy(page, "cy.nodes().length") == len(explorer.view) < n, page)
     emit(page, "tap", "lib")
-    wait_until(lambda: "### lib" in explorer._details.object, page)
+    wait_until(lambda: explorer._details.title.object == "lib", page)
+    expect(page.locator(".head", has_text="Depends on")).to_be_visible()
     emit(page, "dbltap", "app")
     wait_until(lambda: explorer.focus == "app", page)
 
@@ -261,8 +265,10 @@ def test_explorer_html_download_is_self_contained(page, prefix, monkeypatch, tmp
     explorer = Explorer(source=str(prefix))
     serve_component(page, explorer)
     wait_for_nodes(page, len(explorer.view))
+    page.get_by_role("button", name="Export").click()
     with page.expect_download() as download:
-        page.locator("button", has_text="HTML").first.click()
+        page.get_by_role("menuitem", name="Interactive HTML").click()
+    assert download.value.suggested_filename == "env.html"
     saved = tmp_path / "saved.html"
     download.value.save_as(saved)
 
@@ -275,6 +281,99 @@ def test_explorer_html_download_is_self_contained(page, prefix, monkeypatch, tmp
     wait_until(lambda: exported.locator(".cy-container").count() == 1, exported, timeout=15000)
     expect(exported.locator(".cy-toolbar")).to_have_css("display", "flex")
     assert failed == []
+
+
+def test_export_menu_downloads_dot(page, prefix, monkeypatch):
+    monkeypatch.setattr(app_module, "discovered_environments", lambda: {})
+    explorer = Explorer(source=str(prefix))
+    serve_component(page, explorer)
+    wait_for_nodes(page, len(explorer.view))
+    page.get_by_role("button", name="Export").click()
+    with page.expect_download() as download:
+        page.get_by_role("menuitem", name="DOT (Graphviz)").click()
+    assert download.value.suggested_filename == "env.dot"
+    assert '"lib" -> "base"' in download.value.path().read_text()
+
+
+def test_explorer_details_panel_follows_selection(page, prefix, monkeypatch):
+    monkeypatch.setattr(app_module, "discovered_environments", lambda: {})
+    explorer = Explorer(source=str(prefix))
+    serve_component(page, explorer)
+    wait_for_nodes(page, len(explorer.view))
+    # Nothing selected: the environment summary, and no floating card over the graph.
+    expect(page.get_by_text("Most needed")).to_be_visible()
+    expect(page.locator(".cy-card")).to_be_hidden()
+    emit(page, "tap", "base")
+    expect(page.locator(".head", has_text="Needed by")).to_be_visible()
+    wait_until(lambda: explorer._details.title.object == "base", page)
+    page.get_by_role("button", name="Focus", exact=True).click()
+    wait_until(lambda: explorer.focus == "base", page)
+    wait_until(lambda: cy(page, "cy.$('.focus').map(n => n.id())") == ["base"], page)
+    # Clicking a related package in the list selects it.
+    page.get_by_text("lib", exact=True).first.click()
+    wait_until(lambda: explorer._graph.selected == "lib", page)
+    page.get_by_role("button", name="Isolate").click()
+    wait_until(lambda: explorer._graph.isolated, page)
+    wait_until(lambda: cy(page, "cy.nodes(':visible').length") < len(explorer.view), page)
+
+
+def chain(n):
+    """A path of ``n`` packages, which dagre lays out as a long line."""
+    nodes = [
+        {"id": f"p{i}", "label": f"p{i}", "in": int(i > 0), "out": int(i < n - 1)} for i in range(n)
+    ]
+    edges = [{"source": f"p{i}", "target": f"p{i + 1}"} for i in range(n - 1)]
+    return {"nodes": nodes, "edges": edges}
+
+
+def star(n):
+    """One package needed by ``n`` others: a wide, one-rank-deep graph."""
+    nodes = [{"id": "core", "label": "core", "in": n, "out": 0}]
+    nodes += [{"id": f"user{i}", "label": f"user{i}", "in": 0, "out": 1} for i in range(n)]
+    edges = [{"source": f"user{i}", "target": "core"} for i in range(n)]
+    return {"nodes": nodes, "edges": edges}
+
+
+def test_auto_layout_picks_orientation_for_canvas(page):
+    graph = CytoscapeGraph(elements=chain(6), height=400, width=1000)
+    serve_component(page, graph)
+    wait_for_nodes(page, 6)
+    # A chain is tall in TB, so a wide canvas gets LR.
+    root = page.locator(".cy-container").locator("xpath=..")
+    wait_until(lambda: root.get_attribute("data-layout") == "dagre-LR", page)
+    assert page.locator(".cy-toolbar select").nth(1).is_disabled()
+    graph.layout = "dagre"
+    expect(page.locator(".cy-toolbar select").nth(1)).to_be_enabled()
+
+
+def test_auto_layout_falls_back_to_fcose_and_overview(page):
+    graph = CytoscapeGraph(elements=star(150), height=400, width=600)
+    serve_component(page, graph)
+    wait_for_nodes(page, 151)
+    root = page.locator(".cy-container").locator("xpath=..")
+    wait_until(lambda: root.get_attribute("data-layout") == "fcose", page)
+    # Too far out for labels: the overview style replaces the boxes.
+    wait_until(lambda: root.get_attribute("data-overview") == "1", page)
+    assert cy(page, "cy.$id('core').hasClass('overview')")
+    assert cy(page, "cy.$id('core').style('shape')") == "ellipse"
+    # Landmarks (the hub and leaves) keep a label, sized in screen pixels.
+    assert cy(page, "cy.$id('core').style('label')") == "core"
+    font = cy(page, "parseFloat(cy.$id('core').style('font-size')) * cy.zoom()")
+    assert font == pytest.approx(12, rel=0.05)
+    # Zooming in restores the labelled boxes.
+    cy(page, "(cy.zoom({level: 1, position: cy.$id('core').position()}), null)")
+    wait_until(lambda: root.get_attribute("data-overview") == "0", page)
+    assert cy(page, "cy.$id('core').style('shape')") == "round-rectangle"
+
+
+def test_fit_does_not_overzoom_small_graphs(page):
+    graph = CytoscapeGraph(elements=chain(2), height=500, width=800)
+    serve_component(page, graph)
+    wait_for_nodes(page, 2)
+    wait_until(lambda: cy(page, "cy.zoom()") == pytest.approx(1.25), page)
+    cy(page, "(cy.zoom(3), null)")
+    page.get_by_role("button", name="Fit").click()
+    wait_until(lambda: cy(page, "cy.zoom()") == pytest.approx(1.25), page)
 
 
 CHANGED = {
@@ -339,6 +438,19 @@ def test_plain_graph_has_no_legend(page):
     assert cy(page, "cy.nodes('.faded').length") == 0
 
 
+def check_latest(page):
+    """Open the sidebar's Versions section and look up the newest versions."""
+    page.get_by_text("Versions", exact=True).first.click()
+    page.get_by_role("button", name="Check latest").click()
+
+
+def preview_in_details(page, explorer, name):
+    """Select ``name`` and preview its newest version from the details' Versions tab."""
+    explorer._graph.selected = name
+    page.get_by_role("tab", name="Versions").click()
+    page.get_by_role("button", name="Preview change").click()
+
+
 def test_explorer_previews_a_version_change(page, prefix, tmp_path, monkeypatch):
     monkeypatch.setattr(app_module, "discovered_environments", lambda: {})
     channel = make_channel(
@@ -358,13 +470,12 @@ def test_explorer_previews_a_version_change(page, prefix, tmp_path, monkeypatch)
     serve_component(page, explorer)
     wait_for_nodes(page, len(explorer.view))
 
-    page.get_by_role("button", name="Check latest versions").click()
+    check_latest(page)
     wait_until(lambda: explorer._updates.availability is not None, page)
     wait_until(lambda: cy(page, "cy.$id('lib').data('latest')") == "2.0", page)
     assert "outdated" in explorer._stats.object
 
-    explorer._updates.package = "lib"
-    page.get_by_role("button", name="Preview change").click()
+    preview_in_details(page, explorer, "lib")
     wait_until(lambda: explorer._updates.plan is not None, page)
     wait_until(lambda: cy(page, "cy.$id('lib').data('change')") == "upgrade", page)
     assert cy(page, "cy.$id('helper').data('change')") == "add"
@@ -418,17 +529,17 @@ def test_explorer_keeps_selection_centered_across_updates(page, prefix, tmp_path
     explorer._graph.selected = "lib"
     wait_until(lambda: cy(page, "cy.$id('lib').selected()"), page)
     cy(page, "(cy.zoom({level: 1.2, renderedPosition: {x: 100, y: 100}}), null)")
+    cy(page, "(cy.panBy({x: 150, y: 90}), null)")
     before = offset()
     assert before["dx"] > 20 or before["dy"] > 20
 
-    page.get_by_role("button", name="Check latest versions").click()
+    check_latest(page)
     wait_until(lambda: cy(page, "cy.$id('lib').data('latest')") == "2.0", page)
     after = offset()
     assert after["dx"] < 2 and after["dy"] < 2
     assert after["zoom"] == pytest.approx(before["zoom"])
 
-    explorer._updates.package = "lib"
-    page.get_by_role("button", name="Preview change").click()
+    preview_in_details(page, explorer, "lib")
     wait_until(lambda: cy(page, "cy.$id('lib').data('change')") == "upgrade", page)
     after = offset()
     assert after["dx"] < 2 and after["dy"] < 2
@@ -456,12 +567,11 @@ def test_preview_shows_only_changed_packages_by_default(page, prefix, tmp_path, 
     wait_for_nodes(page, total)
     expect(page.get_by_text("Show only changed packages")).to_be_hidden()
 
-    page.get_by_role("button", name="Check latest versions").click()
+    check_latest(page)
     wait_until(lambda: explorer._updates.availability is not None, page)
-    expect(page.get_by_text("click a package in the graph")).to_be_visible()
+    expect(page.get_by_text("open its Versions tab")).to_be_visible()
 
-    explorer._updates.package = "lib"
-    page.get_by_role("button", name="Preview change").click()
+    preview_in_details(page, explorer, "lib")
     wait_until(lambda: explorer._updates.plan is not None, page)
     # lib, base, helper change; lib's dependencies add no further nodes.
     # Changed: lib and base (upgrade), helper and ghost (now installable), x and y (unneeded).

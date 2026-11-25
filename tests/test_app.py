@@ -1,5 +1,6 @@
 import json
 
+import param
 import pytest
 
 from conda_visualizer import app as app_module
@@ -52,10 +53,50 @@ def test_explorer_focus_direction_depth(prefix):
 
 def test_explorer_selection_updates_details(prefix):
     explorer = Explorer(source=str(prefix))
+    details = explorer._details
+    assert details._environment.visible and not details._package.visible
+    assert {i["name"] for i in details.leaves.items} == set(explorer.full.leaves())
     explorer._graph.selected = "lib"
-    assert "### lib" in explorer._details.object
-    assert "`app` lib >=1" in explorer._details.object
-    assert "lib==1.5" in explorer._tree.object
+    assert details._package.visible and not details._environment.visible
+    assert details.title.object == "lib"
+    # The row already names the package, so the spec shows only the constraint.
+    assert {"name": "app", "value": ">=1"} in details.whoneeds.items
+    assert "lib==1.5" in details.tree.object
+    explorer._graph.selected = None
+    assert details._environment.visible
+
+
+def test_details_lists_select_and_focus(prefix):
+    explorer = Explorer(source=str(prefix))
+    explorer.focus = "lib"
+    explorer._details.depends._handle_msg({"type": "select", "name": "base"})
+    assert explorer._graph.selected == "base"
+    explorer._details._focus_btn.clicks += 1
+    assert explorer.focus == "base"
+    assert explorer._focus_chip.label == "base" and explorer._focus_chip.visible
+    assert explorer._details._focus_btn.label == "Clear focus"
+    explorer._focus_chip.clicks += 1
+    assert explorer.focus is None and not explorer._focus_chip.visible
+    explorer._details._isolate_btn.clicks += 1
+    assert explorer._graph.isolated
+    assert explorer._details._isolate_btn.label == "Show all"
+
+
+def test_sidebar_depth_and_direction(prefix):
+    explorer = Explorer(source=str(prefix))
+    assert explorer._depth.disabled and explorer._depth.value == 11
+    explorer.focus = "app"
+    with param.edit_constant(explorer._depth):
+        explorer._depth.value_throttled = 1
+    assert explorer.depth == 1
+    assert set(explorer.view.graph) == {"app", "lib", "python"}
+    assert "1 level" in explorer._depth_label.object
+    with param.edit_constant(explorer._depth):
+        explorer._depth.value_throttled = 11
+    assert explorer.depth == 0
+    explorer.direction = "depends"
+    assert explorer._graph.highlight == "depends"
+    assert not explorer._details.whoneeds.visible
 
 
 def test_explorer_dblclick_focuses(prefix):
@@ -89,11 +130,38 @@ def test_explorer_bad_source_shows_error(prefix, tmp_path):
 def test_explorer_downloads(prefix):
     explorer = Explorer(source=str(prefix))
     explorer.focus = "lib"
-    assert '"lib" -> "base"' in explorer._dot_file().read()
-    assert json.loads(explorer._json_file().read())["nodes"]
-    html = explorer._html_file().read()
+    assert '"lib" -> "base"' in explorer._dot_text()
+    assert json.loads(explorer._json_text())["nodes"]
+    html = explorer._html_text()
     assert "<html" in html.lower() and "cytoscape" in html
-    assert explorer._html.filename == "env-lib.html"
+
+
+def test_explorer_export_menu(prefix, monkeypatch):
+    explorer = Explorer(source=str(prefix))
+    explorer.focus = "lib"
+    sent = []
+    monkeypatch.setattr(explorer._graph, "_send_msg", sent.append)
+    for item in explorer._export.items:
+        explorer._on_export(item)
+    by_format = {m.get("format") or m["filename"].rsplit(".", 1)[1]: m for m in sent}
+    assert set(by_format) == {"html", "png", "svg", "dot", "json"}
+    assert by_format["png"] == {"type": "export", "format": "png", "filename": "env-lib"}
+    assert by_format["html"]["filename"] == "env-lib.html"
+    assert by_format["html"]["mime"] == "text/html"
+    assert '"lib" -> "base"' in by_format["dot"]["text"]
+
+
+def test_explorer_focus_selects_focused_package(prefix):
+    explorer = Explorer(source=str(prefix))
+    explorer._graph.selected = "base"
+    # base stays in lib's neighborhood, but the new focus is what the user wants to inspect.
+    explorer.focus = "lib"
+    assert explorer._graph.selected == "lib"
+    explorer._graph.selected = "base"
+    explorer.depth = 1
+    assert explorer._graph.selected == "base"
+    explorer.focus = None
+    assert explorer._graph.selected == "base"
 
 
 def test_export_html(prefix, tmp_path):
@@ -173,5 +241,7 @@ def test_upload_value_before_filename(browser_mode):
 def test_version_tools_hidden_without_rattler(monkeypatch, prefix):
     monkeypatch.setattr(app_module, "rattler", None)
     explorer = Explorer(source=str(prefix))
-    assert explorer._versions_section() == []
-    assert explorer._page.main[0][2]._names == ["Package", "Packages", "Leaves", "Cycles", "Tree"]
+    assert explorer._accordion._names == ["Filters", "Display"]
+    assert not explorer._latest.visible
+    assert explorer._tab_titles == ["Graph", "Packages", "Leaves", "Cycles"]
+    assert explorer._details.tabs._names == ["Relations", "Tree"]

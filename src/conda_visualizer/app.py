@@ -7,6 +7,7 @@ pass ``?source=<prefix|env name|file>`` to open a specific input.
 from __future__ import annotations
 
 import functools
+import html
 import io
 from pathlib import Path
 
@@ -17,6 +18,7 @@ import param
 
 # Absolute imports so `panel serve app.py` can run this file as a script.
 from conda_visualizer.component import CytoscapeGraph
+from conda_visualizer.details_panel import DetailsPanel
 from conda_visualizer.export import standalone
 from conda_visualizer.graph import DependencyGraph
 from conda_visualizer.sources import (
@@ -52,6 +54,43 @@ COMMON = ("python", "conda")
 #: Above this many nodes the full view is replaced by the requested packages.
 MAX_NODES = 1500
 
+#: Export menu entries: label -> (icon, format).
+EXPORTS = {
+    "Interactive HTML": ("public", "html"),
+    "PNG image": ("image", "png"),
+    "SVG image": ("polyline", "svg"),
+    "DOT (Graphviz)": ("account_tree", "dot"),
+    "JSON": ("data_object", "json"),
+}
+
+MIME_TYPES = {"html": "text/html", "dot": "text/vnd.graphviz", "json": "application/json"}
+
+LAYOUT_NAMES = {
+    "Auto": "auto",
+    "Hierarchy": "dagre",
+    "Layered (ELK)": "elk",
+    "Organic": "fcose",
+    "Breadth-first": "breadthfirst",
+    "Force-directed": "cose",
+    "Concentric": "concentric",
+    "Circle": "circle",
+    "Grid": "grid",
+}
+
+ISOLATE_TIP = "Show only the selected package and its relatives"
+
+#: Direction applies only to the hierarchical layouts.
+RANKED = ("dagre", "elk")
+
+SOURCE_CSS = """
+.src { display: flex; flex-direction: column; min-width: 0; }
+.src b {
+  font: 600 15px/1.3 Inter, Arial, sans-serif; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.src span { font-size: 13px; opacity: 0.7; }
+"""
+
 
 @functools.cache
 def discovered_environments() -> dict[str, str]:
@@ -75,11 +114,15 @@ class Explorer(pn.viewable.Viewer):
 
     focus = param.Selector(default=None, objects=[], allow_None=True, label="Focus package")
 
-    direction = param.Selector(default="both", objects=["both", "depends", "whoneeds"])
+    direction = param.Selector(
+        default="both",
+        objects={"Both": "both", "Depends on": "depends", "Needed by": "whoneeds"},
+        label="Show",
+    )
 
-    depth = param.Integer(default=0, bounds=(0, 10), label="Depth (0 = unlimited)")
+    depth = param.Integer(default=0, bounds=(0, 10), doc="Levels around the focus; 0 for all.")
 
-    exclude = param.ListSelector(default=[], objects=[], label="Stop at (keep, don't expand)")
+    exclude = param.ListSelector(default=[], objects=[], label="Stop expanding at")
 
     hide = param.ListSelector(default=[], objects=[], label="Hide packages")
 
@@ -99,37 +142,38 @@ class Explorer(pn.viewable.Viewer):
 
     def __init__(self, **params):
         params.setdefault("source", default_source_path())
+        # The app draws its own Material toolbar and details panel; the built-in
+        # ones remain for the standalone HTML export.
         self._graph = CytoscapeGraph(
-            sizing_mode="stretch_width", height=680, min_height=400, show_details=True
+            sizing_mode="stretch_both", min_height=400, toolbar=False, show_details=False
         )
-        self._details = pn.pane.Markdown(sizing_mode="stretch_width", margin=(0, 10))
-        self._tree = pn.pane.Markdown(sizing_mode="stretch_width", margin=(0, 10))
-        self._stats = pn.pane.Markdown(margin=(0, 10))
+        self._stats = pn.pane.HTML(
+            margin=(0, 12), align="center", styles={"white-space": "nowrap", "font-size": "13px"}
+        )
         self._message = pmui.Alert(
             visible=False, severity="warning", margin=(5, 10), sizing_mode="stretch_width"
         )
-        self._table = pn.widgets.Tabulator(
-            pd.DataFrame(),
+        table = dict(
             sizing_mode="stretch_width",
-            height=420,
+            styles={"height": "calc(100vh - 150px)"},
             theme="materialize",
             show_index=False,
             disabled=True,
             pagination=None,
             header_filters=True,
         )
-        self._leaves = pn.widgets.Tabulator(
-            pd.DataFrame(),
-            sizing_mode="stretch_width",
-            height=420,
-            theme="materialize",
-            show_index=False,
-            disabled=True,
-            header_filters=True,
-        )
+        self._table = pn.widgets.Tabulator(pd.DataFrame(), **table)
+        self._leaves = pn.widgets.Tabulator(pd.DataFrame(), **table)
         self._cycles = pn.pane.Markdown(sizing_mode="stretch_width")
         self._updates = UpdatesPanel()
+        self._updates.table.param.update(
+            sizing_mode="stretch_width", height=None, styles={"height": "calc(100vh - 150px)"}
+        )
+        self._details = DetailsPanel(
+            version_controls=self._updates.package_controls if rattler else None
+        )
         self._keep_view = False
+        self._last_focus: str | None = None
         self._source_obj: Source | None = None
         self._uploaded: tuple | None = None
         super().__init__(**params)
@@ -185,32 +229,78 @@ class Explorer(pn.viewable.Viewer):
         self._env_lock_select = pmui.Select.from_param(
             self.param.environment, sizing_mode="stretch_width", visible=False
         )
-        self._focus_input = pmui.AutocompleteInput.from_param(
-            self.param.focus,
-            placeholder="Type to search…",
+        self._source_summary = pn.pane.HTML(
+            sizing_mode="stretch_width", margin=0, stylesheets=[SOURCE_CSS]
+        )
+        self._focus_chip = pmui.Chip(
+            label="", icon="cancel", color="primary", size="small", visible=False,
+            description="Clear focus",
+        )  # fmt: skip
+        self._focus_hint = pn.pane.Markdown(
+            "No focus. Double-click a package, or use **Focus** in its details, to show "
+            "only its neighborhood.",
+            margin=(0, 10),
+            sizing_mode="stretch_width",
+            styles={"font-size": "13px", "opacity": "0.8"},
+        )
+        self._direction = pmui.RadioButtonGroup.from_param(
+            self.param.direction, size="small", sizing_mode="stretch_width"
+        )
+        # 1 to 10 levels, with one more step at the right end for unlimited.
+        self._depth = pmui.IntSlider(
+            label="",
+            start=1,
+            end=11,
+            value=11,
+            marks=[{"value": 1, "label": "1"}, {"value": 11, "label": "All"}],
+            show_value=False,
+            margin=(5, 20, 15, 20),
+            sizing_mode="stretch_width",
+        )
+        self._depth_label = pn.pane.HTML(
+            margin=(10, 12, 0, 0), align="center", styles={"font-size": "14px"}
+        )
+        self._exclude = pmui.MultiChoice.from_param(
+            self.param.exclude, placeholder="Pick packages…", sizing_mode="stretch_width"
+        )
+        self._hide = pmui.MultiChoice.from_param(
+            self.param.hide, placeholder="Pick packages…", sizing_mode="stretch_width"
+        )
+        self._hide_virtual = pmui.Switch.from_param(self.param.hide_virtual)
+        self._small = pmui.Switch.from_param(self.param.small)
+
+        self._find = pmui.AutocompleteInput(
+            placeholder="Find package",
             search_strategy="includes",
             min_characters=1,
             restrict=True,
-            sizing_mode="stretch_width",
-        )
-        self._direction = pmui.RadioButtonGroup.from_param(
-            self.param.direction,
             size="small",
-            sizing_mode="stretch_width",
+            width=190,
+            margin=(10, 5),
         )
-        self._depth = pmui.IntSlider.from_param(
-            self.param.depth, margin=(10, 20), sizing_mode="stretch_width"
-        )
-        self._exclude = pmui.MultiChoice.from_param(self.param.exclude, sizing_mode="stretch_width")
-        self._hide = pmui.MultiChoice.from_param(self.param.hide, sizing_mode="stretch_width")
-        self._hide_virtual = pmui.Switch.from_param(self.param.hide_virtual)
-        self._small = pmui.Switch.from_param(self.param.small)
-        self._clear_focus = pmui.Button(
-            label="Clear focus",
-            icon="close",
-            variant="outlined",
+        self._layout = pmui.Select.from_param(
+            self._graph.param.layout,
+            options=LAYOUT_NAMES,
+            label="Layout",
+            description=None,
             size="small",
-            sizing_mode="stretch_width",
+            width=140,
+            margin=(10, 5),
+        )
+        self._rank_dir = pmui.RadioButtonGroup.from_param(
+            self._graph.param.rank_dir,
+            options={"↓": "TB", "→": "LR"},
+            label="",
+            size="small",
+            width=90,
+            margin=(10, 5),
+        )
+        self._fit = pmui.IconButton(icon="fit_screen", description="Fit to view", margin=(10, 0))
+        self._isolate = pmui.IconButton(
+            icon="filter_center_focus",
+            description=ISOLATE_TIP,
+            margin=(10, 0),
+            disabled=True,
         )
         self._versions = pmui.Switch.from_param(
             self._graph.param.show_versions, label="Show versions"
@@ -219,89 +309,132 @@ class Explorer(pn.viewable.Viewer):
         self._latest = pmui.Switch.from_param(
             self._graph.param.show_latest, label="Show newest versions"
         )
-        self._html = pmui.FileDownload(
-            label="HTML",
-            icon="public",
-            variant="text",
-            color="light",
-            callback=self._html_file,
-            filename="dependencies.html",
-            description="Standalone interactive page; works without a server",
-        )
-        self._dot = pmui.FileDownload(
-            label="DOT",
+        self._export = pmui.MenuButton(
+            label="Export",
             icon="download",
-            variant="text",
+            variant="outlined",
             color="light",
-            callback=self._dot_file,
-            filename="dependencies.dot",
-        )
-        self._json = pmui.FileDownload(
-            label="JSON",
-            icon="data_object",
-            variant="text",
-            color="light",
-            callback=self._json_file,
-            filename="dependencies.json",
+            items=[{"label": label, "icon": icon} for label, (icon, _) in EXPORTS.items()],
         )
 
-    def _section(self, title):
-        return pmui.Typography(title, variant="overline", margin=(15, 10, 0, 10))
-
-    def _versions_section(self) -> list:
-        # Looking up and previewing versions solves with py-rattler, which has
-        # no Pyodide build and is an optional extra elsewhere.
-        if rattler is None:
-            return []
-        return [
-            self._latest,
-            pmui.Divider(),
-            self._section("Versions"),
-            self._updates,
-            self._changes_only_switch,
-        ]
+    def _section(self, title, margin=(15, 10, 0, 10)):
+        return pmui.Typography(title, variant="overline", margin=margin)
 
     def _build_layout(self):
-        sidebar = pmui.Column(
-            self._section("Source"),
+        self._source_card = pmui.Card(
             self._intro,
             self._env_select,
             self._path_input,
             self._upload,
             self._platform_select,
             self._env_lock_select,
-            self._message,
-            pmui.Divider(),
-            self._section("View"),
-            self._focus_input,
-            self._direction,
-            self._depth,
-            self._clear_focus,
-            self._exclude,
-            self._hide,
-            self._hide_virtual,
-            self._small,
-            self._versions,
-            *self._versions_section(),
+            header=self._source_summary,
+            collapsible=True,
+            # In the browser build uploading is the only way in, so it starts open.
+            collapsed=not BROWSER,
+            outlined=True,
+            margin=(5, 10),
             sizing_mode="stretch_width",
         )
-        tabs = pmui.Tabs(
-            ("Package", self._details),
+        sections = [
+            (
+                "Filters",
+                pmui.Column(
+                    self._exclude,
+                    self._hide,
+                    self._hide_virtual,
+                    self._small,
+                    sizing_mode="stretch_width",
+                ),
+            ),
+            ("Display", pmui.Column(self._versions, self._latest, sizing_mode="stretch_width")),
+        ]
+        # Looking up and previewing versions solves with py-rattler, which has
+        # no Pyodide build and is an optional extra elsewhere.
+        if rattler is not None:
+            sections.append(
+                (
+                    "Versions",
+                    pmui.Column(
+                        self._updates.environment_controls,
+                        self._changes_only_switch,
+                        sizing_mode="stretch_width",
+                    ),
+                )
+            )
+        else:
+            self._latest.visible = False
+        self._accordion = pmui.Accordion(
+            *sections,
+            active=[0],
+            toggle=False,
+            title_variant="overline",
+            disable_gutters=True,
+            sizing_mode="stretch_width",
+            margin=(10, 0),
+        )
+        sidebar = pmui.Column(
+            self._section("Source"),
+            self._source_card,
+            self._message,
+            pmui.Divider(margin=(10, 0)),
+            self._section("Focus", margin=(5, 10, 0, 10)),
+            pmui.Row(self._focus_chip, margin=(0, 5)),
+            self._focus_hint,
+            self._direction,
+            pmui.Row(
+                pmui.Typography("Depth", variant="body2", margin=(10, 10, 0, 10)),
+                pn.layout.HSpacer(),
+                self._depth_label,
+                align="center",
+                sizing_mode="stretch_width",
+            ),
+            self._depth,
+            pmui.Divider(margin=(0, 0)),
+            self._accordion,
+            sizing_mode="stretch_width",
+        )
+        toolbar = pmui.Row(
+            self._find,
+            self._layout,
+            self._rank_dir,
+            self._fit,
+            self._isolate,
+            pn.layout.HSpacer(),
+            self._stats,
+            align="center",
+            sizing_mode="stretch_width",
+            margin=(4, 4, 0, 4),
+            styles={"border-bottom": "1px solid rgb(128 128 128 / 25%)", "flex-wrap": "wrap"},
+        )
+        graph_card = pmui.Paper(
+            toolbar,
+            self._graph,
+            variant="outlined",
+            sizing_mode="stretch_both",
+            margin=0,
+        )
+        # Fills the window below the header and tab bar, so the graph and details never
+        # push the page into scrolling.
+        graph_view = pmui.Row(
+            graph_card,
+            self._details,
+            sizing_mode="stretch_width",
+            margin=(12, 0, 0, 0),
+            styles={"height": "calc(100vh - 150px)", "min-height": "480px"},
+        )
+        tabs = [
+            ("Graph", graph_view),
             ("Packages", self._table),
             ("Leaves", self._leaves),
             *([("Changes", self._updates.table)] if rattler else []),
             ("Cycles", self._cycles),
-            ("Tree", self._tree),
-            dynamic=True,
-            sizing_mode="stretch_width",
+        ]
+        self._tab_titles = [title for title, _ in tabs]
+        self._tabs = pmui.Tabs(
+            *tabs, dynamic=True, sizing_mode="stretch_width", margin=(0, 16, 16, 16)
         )
-        main = pmui.Column(
-            self._stats,
-            pmui.Paper(self._graph, sizing_mode="stretch_width"),
-            tabs,
-            sizing_mode="stretch_width",
-            margin=10,
-        )
+        main = self._tabs
         self._page = pmui.Page(
             title="Conda Visualizer",
             logo=LOGO,
@@ -309,23 +442,26 @@ class Explorer(pn.viewable.Viewer):
             theme_config=THEME_CONFIG,
             sidebar=[sidebar],
             main=[main],
-            header=[
-                pmui.Row(
-                    pn.layout.HSpacer(),
-                    self._html,
-                    self._dot,
-                    self._json,
-                    sizing_mode="stretch_width",
-                )
-            ],
+            header=[pmui.Row(pn.layout.HSpacer(), self._export, sizing_mode="stretch_width")],
             sidebar_width=330,
         )
 
     def _wire(self):
         self._upload.param.watch(self._on_upload, ["value", "filename"])
-        self._clear_focus.on_click(self._on_clear_focus)
+        self._focus_chip.param.watch(self._on_clear_focus, "clicks")
+        self._export.on_click(self._on_export)
         self._graph.on_dblclick(self._on_dblclick)
-        self._graph.param.watch(self._update_details, "selected")
+        self._graph.param.watch(self._update_details, ["selected", "highlight"])
+        self._graph.param.watch(self._on_isolated, "isolated")
+        self._graph.param.watch(self._sync_layout_controls, "layout")
+        self._depth.param.watch(self._on_depth_slider, "value_throttled")
+        self._find.param.watch(self._on_find, "value")
+        self._fit.on_click(lambda event: self._graph.fit())
+        self._isolate.on_click(self._toggle_isolate)
+        self._details.on_select(self.go_to)
+        self._details.on_focus = lambda name: setattr(self, "focus", name)
+        self._details.on_isolate = self._toggle_isolate
+        self._details.on_close = lambda: setattr(self._graph, "selected", None)
         self._table.on_click(self._on_row_click)
         self._updates.table.on_click(self._on_row_click)
         self._updates.param.watch(self._on_current, "current")
@@ -334,6 +470,10 @@ class Explorer(pn.viewable.Viewer):
         self._leaves.on_click(self._on_row_click)
         self._page.param.watch(self._sync_theme, "dark_theme")
         self._graph.dark_theme = self._page.dark_theme
+        self._details.set_dark(self._page.dark_theme)
+        self._sync_layout_controls()
+        self._sync_direction()
+        self._sync_focus_controls()
 
     def __panel__(self):
         return self._page
@@ -399,6 +539,13 @@ class Explorer(pn.viewable.Viewer):
             self.param.focus.objects = names
             self.param.exclude.objects = names
             self.param.hide.objects = names
+            self._find.options = names
+            name = Path(full.source).name or full.source
+            meta = " · ".join(p for p in (full.platform, f"{len(full)} packages") if p)
+            self._source_summary.object = (
+                f'<div class="src"><b title="{html.escape(full.source)}">{html.escape(name)}</b>'
+                f"<span>{html.escape(meta)}</span></div>"
+            )
             self.param.update(
                 focus=self.focus if self.focus in full else None,
                 exclude=[n for n in self.exclude if n in full],
@@ -465,7 +612,10 @@ class Explorer(pn.viewable.Viewer):
             if self._keep_view:
                 elements["keep_view"] = True
             self._graph.param.update(elements=elements, filename=self._export_name)
-            if not self._graph.selected or self._graph.selected not in view:
+            # A new focus is what the user is now looking at, so it replaces the selection.
+            refocused = self.focus is not None and self.focus != self._last_focus
+            self._last_focus = self.focus
+            if refocused or not self._graph.selected or self._graph.selected not in view:
                 self._graph.selected = self.focus
             self._graph.loading = False
             self._update_tables(full, view)
@@ -483,66 +633,98 @@ class Explorer(pn.viewable.Viewer):
         return changed | (context & nodes)
 
     def _update_stats(self, full, view, truncated):
-        where = full.source + (f" · {full.platform}" if full.platform else "")
-        shown = f"showing {len(view)} of {len(full)} packages, {view.graph.number_of_edges()} edges"
-        note = (
-            f" (limited to direct dependencies of requested packages above {MAX_NODES})"
+        shown = (
+            f"<b>{len(view)}</b> of {len(full)} packages"
+            if len(view) < len(full)
+            else f"<b>{len(full)}</b> packages"
+        )
+        parts = [shown, f"<b>{view.graph.number_of_edges()}</b> edges"]
+        if any("latest" in d for _, d in full.graph.nodes(data=True)):
+            late = sum(1 for _, d in full.graph.nodes(data=True) if d.get("outdated"))
+            parts.append(f"<b>{late}</b> outdated")
+        title = (
+            f"Limited to direct dependencies of requested packages above {MAX_NODES}"
             if truncated
             else ""
         )
-        late = sum(1 for _, d in full.graph.nodes(data=True) if d.get("outdated"))
-        newer = (
-            f"  ·  {late} outdated"
-            if any("latest" in d for _, d in full.graph.nodes(data=True))
-            else ""
-        )
-        self._stats.object = (
-            f"**{where}**  ·  {shown}  ·  {len(full.leaves())} leaves  ·  "
-            f"{len(full.cycles())} cycles{newer}{note}"
-        )
+        self._stats.object = f'<span title="{title}">{" · ".join(parts)}</span>'
 
     def _update_tables(self, full, view):
         self._table.value = pd.DataFrame(view.records())
-        self._leaves.value = pd.DataFrame([r for r in full.records() if r["dependents"] == 0])
+        leaves = [r for r in full.records() if r["dependents"] == 0]
+        self._leaves.value = pd.DataFrame(leaves)
         cycles = full.cycles()
         self._cycles.object = (
             "\n".join(f"- {' → '.join([*c, c[0]])}" for c in cycles)
             if cycles
             else "No dependency cycles."
         )
+        counts = {"Packages": len(view), "Leaves": len(leaves), "Cycles": len(cycles)}
+        self._tabs._names = [f"{t} ({counts[t]})" if t in counts else t for t in self._tab_titles]
 
     def _update_details(self, *_):
         full = self.full
-        name = self._graph.selected or self.focus
+        name = self._graph.selected
+        self._isolate.disabled = not name and not self._graph.isolated
         if full is None or not name or name not in full:
-            self._details.object = (
-                "Click a node to inspect it. Double-click a node to focus the view on it."
-            )
-            self._tree.object = "Select a package to see its dependency tree."
+            self._details.show_environment(full)
             return
-        info = full.details(name)
-        fields = [(k, info.get(k)) for k in ("version", "build", "channel", "kind", "license")]
-        lines = [f"### {name}"]
-        if info.get("requested"):
-            lines.append("*explicitly requested*")
-        lines += [f"**{k}**: {v}  " for k, v in fields if v]
-        if info.get("change"):
-            was = f" (was {info['old_version']})" if info.get("old_version") else ""
-            lines.append(f"**preview**: {info['change']}{was}  ")
-        if info.get("latest"):
-            lines.append(f"**newest available**: {info['latest']}  ")
-        if info.get("size"):
-            lines.append(f"**size**: {info['size'] / 1e6:.2f} MB  ")
-        for key, title in (("depends", "Depends on"), ("whoneeds", "Needed by")):
-            items = info[key]
-            lines.append(f"\n**{title}** ({len(items)})\n")
-            lines += [f"- `{dep}` {spec}" if spec else f"- `{dep}`" for dep, spec in items[:200]]
-        self._details.object = "\n".join(lines)
         reverse = self.direction == "whoneeds"
-        tree = full.tree(name, reverse=reverse, exclude=self.exclude)
-        self._tree.object = f"```\n{tree}\n```"
+        self._details.show_package(
+            full.details(name),
+            full.tree(name, reverse=reverse, exclude=self.exclude),
+            focused=name == self.focus,
+            isolated=self._graph.isolated,
+            highlight=self._graph.highlight,
+        )
+
+    def _sync_focus_controls(self):
+        self._focus_chip.param.update(label=self.focus or "", visible=self.focus is not None)
+        self._focus_hint.visible = self.focus is None
+        # Depth only limits a focused view, so without a focus it reads as "All".
+        self._depth.disabled = self.focus is None
+        self._depth.value = self.depth or 11
+        levels = "All levels" if not self.depth else f"{self.depth} level" + "s" * (self.depth > 1)
+        self._depth_label.object = f"<b>{levels}</b>"
 
     # Handlers -------------------------------------------------------------
+
+    @param.depends("focus", "depth", watch=True)
+    def _on_focus_changed(self):
+        self._sync_focus_controls()
+
+    @param.depends("direction", watch=True)
+    def _sync_direction(self):
+        self._graph.highlight = self.direction
+
+    def _on_depth_slider(self, event):
+        self.depth = 0 if event.new >= 11 else event.new
+
+    def _sync_layout_controls(self, *_):
+        self._rank_dir.disabled = self._graph.layout not in RANKED
+
+    def _on_isolated(self, event):
+        self._details.set_isolated(event.new)
+        self._isolate.param.update(
+            icon="select_all" if event.new else "filter_center_focus",
+            description="Show all packages" if event.new else ISOLATE_TIP,
+        )
+
+    def _toggle_isolate(self, *_):
+        self._graph.isolated = not self._graph.isolated
+
+    def _on_find(self, event):
+        if event.new:
+            self.go_to(event.new)
+            self._find.value = None
+
+    def go_to(self, name: str) -> None:
+        """Select ``name``, focusing it first when the current view leaves it out."""
+        self._tabs.active = 0
+        if self.view is not None and name in self.view:
+            self._graph.selected = name
+        else:
+            self.focus = name
 
     def _on_dblclick(self, name):
         self.focus = name
@@ -551,16 +733,12 @@ class Explorer(pn.viewable.Viewer):
         self.focus = None
 
     def _on_row_click(self, event):
-        if event.column != "name" or not event.value:
-            return
-        name = event.value
-        if self.view is not None and name in self.view:
-            self._graph.selected = name
-        else:
-            self.focus = name
+        if event.column == "name" and event.value:
+            self.go_to(event.value)
 
     def _sync_theme(self, event):
         self._graph.dark_theme = event.new
+        self._details.set_dark(event.new)
 
     # Export ---------------------------------------------------------------
 
@@ -572,12 +750,18 @@ class Explorer(pn.viewable.Viewer):
             name = name.removesuffix(suffix)
         return f"{name}-{self.focus}" if self.focus else name
 
-    def _dot_file(self):
-        self._dot.filename = f"{self._export_name}.dot"
-        return io.StringIO(self.view.to_dot() if self.view is not None else "digraph {}\n")
+    def _on_export(self, item):
+        fmt = EXPORTS[item["label"]][1]
+        if fmt in ("png", "svg"):
+            self._graph.export(fmt, self._export_name)
+            return
+        text = getattr(self, f"_{fmt}_text")()
+        self._graph.download(text, f"{self._export_name}.{fmt}", MIME_TYPES[fmt])
 
-    def _html_file(self):
-        self._html.filename = f"{self._export_name}.html"
+    def _dot_text(self) -> str:
+        return self.view.to_dot() if self.view is not None else "digraph {}\n"
+
+    def _html_text(self) -> str:
         buffer = io.StringIO()
         if self.view is not None:
             page = standalone(
@@ -591,12 +775,10 @@ class Explorer(pn.viewable.Viewer):
             )
             with pn.config.set(raw_css=[STANDALONE_CSS]):
                 page.save(buffer, title=self._export_name, resources="cdn")
-        buffer.seek(0)
-        return buffer
+        return buffer.getvalue()
 
-    def _json_file(self):
-        self._json.filename = f"{self._export_name}.json"
-        return io.StringIO(self.view.to_json() if self.view is not None else "{}")
+    def _json_text(self) -> str:
+        return self.view.to_json() if self.view is not None else "{}"
 
 
 def create_app(source: str | None = None) -> Explorer:

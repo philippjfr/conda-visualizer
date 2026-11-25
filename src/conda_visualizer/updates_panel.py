@@ -22,11 +22,15 @@ from conda_visualizer.updates import (
     with_availability,
 )
 
-HINT_CHECK = "Press *Check latest versions* to see which packages have newer versions."
-HINT_SELECT = (
-    "To see what a different version would change, click a package in the graph or type its "
-    "name below, choose a version and press *Preview change*."
+HINT_CHECK = (
+    "See which packages have newer versions on their channels. Preview a single package's "
+    "version in its details."
 )
+HINT_SELECT = (
+    "To see what a different version would change, click a package in the graph and open "
+    "its *Versions* tab."
+)
+HINT_PACKAGE = "Press *Check latest* in the sidebar to list the versions on the channels."
 
 PLAN_KINDS = (
     ("upgrade", "upgraded"),
@@ -91,9 +95,15 @@ class UpdatesPanel(pn.viewable.Viewer):
         self._status = pmui.Alert(
             visible=False, severity="info", margin=(5, 10), sizing_mode="stretch_width"
         )
+        self._package_status = pmui.Alert(
+            visible=False, severity="info", margin=(5, 0), sizing_mode="stretch_width"
+        )
         self._summary = pn.pane.Markdown(margin=(0, 10), sizing_mode="stretch_width")
+        self._package_hint = pn.pane.Markdown(
+            HINT_PACKAGE, margin=(0, 0), sizing_mode="stretch_width"
+        )
         self._check = pmui.Button(
-            label="Check latest versions",
+            label="Check latest",
             icon="update",
             variant="outlined",
             size="small",
@@ -108,7 +118,9 @@ class UpdatesPanel(pn.viewable.Viewer):
             restrict=True,
             sizing_mode="stretch_width",
         )
-        self._version = pmui.Select.from_param(self.param.version, sizing_mode="stretch_width")
+        self._version = pmui.Select.from_param(
+            self.param.version, sizing_mode="stretch_width", margin=(10, 0)
+        )
         self._preview = pmui.Button(
             label="Preview change",
             icon="visibility",
@@ -116,9 +128,11 @@ class UpdatesPanel(pn.viewable.Viewer):
             size="small",
             sizing_mode="stretch_width",
             disabled=True,
+            margin=(5, 0),
         )
         self._update_all = pmui.Button(
-            label="Preview updating everything",
+            label="Preview all",
+            description="Preview updating every package to its newest version",
             icon="upgrade",
             variant="outlined",
             size="small",
@@ -138,19 +152,25 @@ class UpdatesPanel(pn.viewable.Viewer):
         self._update_all.on_click(self._on_update_all)
         self._clear.on_click(lambda event: self.clear())
 
-    def __panel__(self):
-        return pmui.Column(
+        self.environment_controls = pmui.Column(
             self._summary,
-            self._check,
             self._scope,
-            self._package,
-            self._version,
-            self._preview,
+            pmui.Row(self._check, self._update_all, sizing_mode="stretch_width"),
             self._status,
-            self._update_all,
             self._clear,
             sizing_mode="stretch_width",
         )
+        # Shown in the selected package's details, so the package itself needs no picker.
+        self.package_controls = pmui.Column(
+            self._package_hint,
+            self._version,
+            self._preview,
+            self._package_status,
+            sizing_mode="stretch_width",
+        )
+
+    def __panel__(self):
+        return self.environment_controls
 
     # State ------------------------------------------------------------------
 
@@ -181,9 +201,16 @@ class UpdatesPanel(pn.viewable.Viewer):
         self._preview.disabled = not (ready and self.package and different)
         self._update_all.disabled = not ready
         self._clear.disabled = self.plan is None
+        self._package_hint.visible = not ready
+        self._preview.visible = self._version.visible = ready
 
-    def _say(self, text: str, severity: str = "info") -> None:
-        self._status.param.update(object=text, severity=severity, visible=bool(text))
+    def _say(self, text: str, severity: str = "info", alert=None) -> None:
+        # Messages about one package's preview appear in its details, next to the button.
+        for widget in (self._status, self._package_status):
+            if widget is (alert or self._status):
+                widget.param.update(object=text, severity=severity, visible=bool(text))
+            elif text:
+                widget.visible = False
 
     def _compose(self) -> None:
         if self._base is None:
@@ -273,23 +300,24 @@ class UpdatesPanel(pn.viewable.Viewer):
         return plan_change(self._base, targets, update_all=update_all, channels=self.channels)
 
     def _apply_plan(self, plan: Plan, label: str) -> None:
+        alert = self._status if label == "everything" else self._package_status
         if not plan:
             self.plan = None
             self.table.value = pd.DataFrame(columns=["name", "change", "from", "to"])
             self._compose()
             self._sync_buttons()
-            self._say(f"Switching {label} changes nothing.", "info")
+            self._say(f"Switching {label} changes nothing.", "info", alert)
             self._summary.object = ""
             return
         self.plan = plan
         self.table.value = pd.DataFrame(plan.rows())
         self._compose()
         self._sync_buttons()
-        self._say("")
-        self._summary.object = (
+        text = (
             f"**Preview: {label}** changes {len(plan.changes)} packages: {describe_counts(plan)}."
-            "\n\nThe full list is in the *Changes* tab."
         )
+        self._say(text if alert is self._package_status else "", "success", alert)
+        self._summary.object = text + "\n\nThe full list is in the *Changes* tab."
 
     def _availability_text(self) -> str:
         if self.availability is None:
@@ -320,14 +348,15 @@ class UpdatesPanel(pn.viewable.Viewer):
     async def _run(self, button, work, apply):
         if self._base is None:
             return
+        alert = self._package_status if button is self._preview else self._status
         button.loading = True
         try:
             result = await asyncio.to_thread(work)
         except UpdateError as exc:
-            self._say(str(exc), "error")
+            self._say(str(exc), "error", alert)
             return
         except Exception as exc:
-            self._say(f"{type(exc).__name__}: {exc}", "error")
+            self._say(f"{type(exc).__name__}: {exc}", "error", alert)
             return
         finally:
             button.loading = False
